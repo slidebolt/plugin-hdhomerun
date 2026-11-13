@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -74,19 +75,24 @@ func (a *App) startRecording(recorderKey string, cmd domain.SwitchTurnOn) {
 	ext := filepath.Ext(rel)
 	rel = strings.TrimSuffix(rel, ext) + "-" + shortHash(fileID) + ext
 	partial := rel + ".partial"
+	if profile == "universal-mp4" {
+		partial = filepath.Join(".staging", fileID+".ts.partial")
+	}
 	finalAbs := filepath.Join(a.config.RecordingDir, rel)
 	partialAbs := filepath.Join(a.config.RecordingDir, partial)
 	if err := os.MkdirAll(filepath.Dir(partialAbs), 0755); err != nil {
 		a.failStart(recorderKey, err)
 		return
 	}
-	fileState := domain.RecordingFile{Status: "recording", RelativePath: rel, PartialPath: partial, Format: fileExt(profile), Profile: profile, Channel: state, Program: input.Program, StartedAt: start}
+	fileState := domain.RecordingFile{Status: domain.RecordingStatusRecording, RelativePath: rel, PartialPath: partial, Format: fileExt(profile), Profile: profile, Channel: state, Program: input.Program, StartedAt: start}
 	_ = a.saveFileDevice(fileID, fileState)
 	a.saveRecorder(recorderKey, domain.RecordingSwitch{Power: true, ChannelKey: input.ChannelKey, Program: input.Program, FileDeviceID: fileID, StartedAt: &start})
+	a.wg.Add(1)
 	go a.capture(ctx, session, recorderKey, fileID, channel.URL, partialAbs, finalAbs, fileState)
 }
 
 func (a *App) capture(ctx context.Context, session *recordingSession, recorderKey, fileID, streamURL, partialAbs, finalAbs string, state domain.RecordingFile) {
+	defer a.wg.Done()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err == nil {
 		var resp *http.Response
@@ -95,10 +101,16 @@ func (a *App) capture(ctx context.Context, session *recordingSession, recorderKe
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
 				err = fmt.Errorf("stream HTTP %d: %s", resp.StatusCode, resp.Header.Get("X-HDHomeRun-Error"))
+			} else if state.Profile == "universal-mp4" {
+				err = copyStream(resp.Body, partialAbs)
 			} else {
 				err = writeStream(ctx, state.Profile, resp.Body, partialAbs)
 			}
 		}
+	}
+	if state.Profile == "universal-mp4" {
+		a.finishCaptureForEncoding(session, recorderKey, fileID, partialAbs, finalAbs, state, err)
+		return
 	}
 	finish := time.Now().UTC()
 	state.FinishedAt = &finish
@@ -113,13 +125,13 @@ func (a *App) capture(ctx context.Context, session *recordingSession, recorderKe
 		state.BytesWritten = info.Size()
 	}
 	if err != nil && !session.stopping.Load() {
-		state.Status = "failed"
+		state.Status = domain.RecordingStatusFailed
 		state.Error = err.Error()
 	} else if err != nil {
-		state.Status = "failed"
+		state.Status = domain.RecordingStatusFailed
 		state.Error = err.Error()
 	} else {
-		state.Status = "completed"
+		state.Status = domain.RecordingStatusCompleted
 		state.PartialPath = ""
 	}
 	_ = a.saveFileDevice(fileID, state)
@@ -127,6 +139,163 @@ func (a *App) capture(ctx context.Context, session *recordingSession, recorderKe
 	delete(a.sessions, recorderKey)
 	a.mu.Unlock()
 	a.saveRecorder(recorderKey, domain.RecordingSwitch{LastError: state.Error})
+}
+
+func copyStream(src io.Reader, path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(f, src)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func (a *App) finishCaptureForEncoding(session *recordingSession, recorderKey, fileID, partialAbs, finalAbs string, state domain.RecordingFile, captureErr error) {
+	a.mu.Lock()
+	delete(a.sessions, recorderKey)
+	a.mu.Unlock()
+	a.saveRecorder(recorderKey, domain.RecordingSwitch{})
+
+	// Canceling is the normal way a timer or person ends a recording. The bytes
+	// already written are a complete transport-stream capture and can be encoded.
+	if captureErr != nil && !session.stopping.Load() {
+		now := time.Now().UTC()
+		state.Status, state.Error, state.FinishedAt = domain.RecordingStatusFailed, captureErr.Error(), &now
+		if info, err := os.Stat(partialAbs); err == nil {
+			state.SourceBytes = info.Size()
+		}
+		_ = a.saveFileDevice(fileID, state)
+		return
+	}
+	capturedAbs := strings.TrimSuffix(partialAbs, ".partial")
+	if err := os.Rename(partialAbs, capturedAbs); err != nil {
+		now := time.Now().UTC()
+		state.Status, state.Error, state.FinishedAt = domain.RecordingStatusFailed, err.Error(), &now
+		_ = a.saveFileDevice(fileID, state)
+		return
+	}
+	info, err := os.Stat(capturedAbs)
+	if err != nil || info.Size() == 0 {
+		if err == nil {
+			err = fmt.Errorf("empty capture")
+		}
+		now := time.Now().UTC()
+		state.Status, state.Error, state.FinishedAt = domain.RecordingStatusFailed, err.Error(), &now
+		_ = a.saveFileDevice(fileID, state)
+		return
+	}
+	state.Status = domain.RecordingStatusEncoding
+	state.PartialPath = strings.TrimSuffix(state.PartialPath, ".partial")
+	state.SourceBytes = info.Size()
+	state.Error = ""
+	_ = a.saveFileDevice(fileID, state)
+	a.encodeUniversal(fileID, capturedAbs, finalAbs, state)
+}
+
+func (a *App) encodeUniversal(fileID, sourceAbs, finalAbs string, state domain.RecordingFile) {
+	a.encodeMu.Lock()
+	defer a.encodeMu.Unlock()
+	if err := a.ctx.Err(); err != nil {
+		return // durable encoding state is resumed on the next start
+	}
+	started := time.Now().UTC()
+	state.EncodingStartedAt = &started
+	_ = a.saveFileDevice(fileID, state)
+	outputPartial := finalAbs + ".partial"
+	args := universalArgs(sourceAbs, outputPartial)
+	err := exec.CommandContext(a.ctx, "ffmpeg", args...).Run()
+	if err == nil {
+		err = validateUniversal(a.ctx, outputPartial)
+	}
+	if err == nil {
+		err = os.Rename(outputPartial, finalAbs)
+	}
+	finished := time.Now().UTC()
+	state.EncodingFinishedAt, state.FinishedAt = &finished, &finished
+	if err != nil {
+		state.Status, state.Error = domain.RecordingStatusFailed, "encode: "+err.Error()
+		_ = os.Remove(outputPartial)
+	} else {
+		state.Status, state.Error, state.PartialPath = domain.RecordingStatusCompleted, "", ""
+		if info, statErr := os.Stat(finalAbs); statErr == nil {
+			state.BytesWritten = info.Size()
+		}
+		_ = os.Remove(sourceAbs)
+	}
+	_ = a.saveFileDevice(fileID, state)
+}
+
+func universalArgs(source, output string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "warning", "-y", "-i", source,
+		"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+		"-vf", "bwdif=mode=send_frame:parity=auto:deint=interlaced,scale=w='min(iw,1920)':h='min(ih,1080)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
+		"-c:v", "libx264", "-preset", "medium", "-crf", "22", "-pix_fmt", "yuv420p", "-profile:v", "high", "-level:v", "4.1",
+		"-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000", "-movflags", "+faststart", output,
+	}
+}
+
+func validateUniversal(ctx context.Context, path string) error {
+	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=codec_name,codec_type,pix_fmt", "-of", "json", path).Output()
+	if err != nil {
+		return fmt.Errorf("ffprobe: %w", err)
+	}
+	var probe struct {
+		Streams []struct {
+			CodecName string `json:"codec_name"`
+			CodecType string `json:"codec_type"`
+			Pixel     string `json:"pix_fmt"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if json.Unmarshal(out, &probe) != nil {
+		return fmt.Errorf("ffprobe returned invalid JSON")
+	}
+	duration, _ := strconv.ParseFloat(probe.Format.Duration, 64)
+	videoOK := false
+	for _, stream := range probe.Streams {
+		if stream.CodecType == "video" && stream.CodecName == "h264" && stream.Pixel == "yuv420p" {
+			videoOK = true
+		}
+	}
+	if !videoOK || duration <= 0 {
+		return fmt.Errorf("invalid universal MP4: h264=%t duration=%g", videoOK, duration)
+	}
+	return nil
+}
+
+func (a *App) recoverEncodings() {
+	entries, err := a.store.Search(PluginID + ".recording-*.file")
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		var entity domain.Entity
+		if json.Unmarshal(entry.Data, &entity) != nil {
+			continue
+		}
+		state, ok := entity.State.(domain.RecordingFile)
+		if !ok || state.Status != domain.RecordingStatusEncoding || state.PartialPath == "" {
+			continue
+		}
+		sourceAbs := filepath.Join(a.config.RecordingDir, state.PartialPath)
+		finalAbs := filepath.Join(a.config.RecordingDir, state.RelativePath)
+		if info, statErr := os.Stat(sourceAbs); statErr != nil || info.Size() == 0 {
+			continue
+		}
+		id := entity.DeviceID
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.encodeUniversal(id, sourceAbs, finalAbs, state)
+		}()
+	}
 }
 
 func writeStream(ctx context.Context, profile string, src io.Reader, path string) error {
@@ -216,7 +385,7 @@ func fileExt(profile string) string {
 	switch profile {
 	case "remux-mkv":
 		return "mkv"
-	case "h264-mp4":
+	case "h264-mp4", "universal-mp4":
 		return "mp4"
 	default:
 		return "ts"

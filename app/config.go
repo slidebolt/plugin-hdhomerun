@@ -25,7 +25,7 @@ func loadConfig() config {
 	}
 	profile := os.Getenv("HDHOMERUN_RECORDING_PROFILE")
 	if profile == "" {
-		profile = "raw-ts"
+		profile = "universal-mp4"
 	}
 	return config{Devices: devices, RecordingDir: dir, Profile: profile, XMLTVURL: os.Getenv("HDHOMERUN_XMLTV_URL"), Refresh: 10 * time.Minute}
 }

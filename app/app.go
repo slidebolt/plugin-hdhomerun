@@ -35,6 +35,8 @@ type App struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	mu            sync.Mutex
+	encodeMu      sync.Mutex
+	wg            sync.WaitGroup
 	channels      map[string]hdhr.Channel
 	channelStates map[string]domain.TVChannel
 	programs      map[string][]domain.TVProgram
@@ -75,6 +77,7 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	if err := a.reconcile(a.ctx); err != nil {
 		log.Printf("plugin-hdhomerun: initial reconcile: %v", err)
 	}
+	a.recoverEncodings()
 	go a.reconcileLoop(a.ctx)
 	log.Println("plugin-hdhomerun: started")
 	return nil, nil
@@ -89,6 +92,7 @@ func (a *App) OnShutdown() error {
 		s.stop()
 	}
 	a.mu.Unlock()
+	a.wg.Wait()
 	for _, sub := range a.subs {
 		_ = sub.Unsubscribe()
 	}
@@ -223,7 +227,7 @@ func (a *App) markInterrupted(fileDeviceID string) {
 		return
 	}
 	now := time.Now().UTC()
-	state.Status = "failed"
+	state.Status = domain.RecordingStatusFailed
 	state.Error = "recording interrupted by restart"
 	state.FinishedAt = &now
 	entity.State = state
