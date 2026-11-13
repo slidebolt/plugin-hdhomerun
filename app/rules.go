@@ -10,6 +10,7 @@ import (
 	"time"
 
 	domain "github.com/slidebolt/sb-domain"
+	messenger "github.com/slidebolt/sb-messenger-sdk"
 	scheduler "github.com/slidebolt/sb-scheduler-sdk"
 )
 
@@ -112,10 +113,42 @@ func (a *App) createAiringTimer(channelKey string, program *domain.TVProgram, pr
 	target := a.selectRecorder(program.StartsAt, program.EndsAt)
 	input, _ := json.Marshal(domain.RecordingStartInput{ChannelKey: channelKey, Program: program, Profile: profile})
 	id := "airing-" + shortHash(program.AiringID)
-	_, err := a.scheduler.CreateTimer(scheduler.CreateTimerRequest{ID: id, Name: program.Title, Timer: domain.Timer{Enabled: true, Target: target, Input: input, On: domain.TimerTrigger{Kind: "at", At: &program.StartsAt}, Off: domain.TimerTrigger{Kind: "at", At: &program.EndsAt}}})
+	timerKey, err := a.scheduler.CreateTimer(scheduler.CreateTimerRequest{ID: id, Name: program.Title, Timer: domain.Timer{Enabled: true, Target: target, Input: input, On: domain.TimerTrigger{Kind: "at", At: &program.StartsAt}, Off: domain.TimerTrigger{Kind: "at", At: &program.EndsAt}}})
 	if err != nil {
 		log.Printf("plugin-hdhomerun: create airing timer: %v", err)
+		return
 	}
+	channel := a.channelStates[channelKey]
+	recording := domain.TVRecording{Status: "scheduled", Provider: PluginID, ExternalID: timerKey.Key(), Channel: channel, Program: *program, StartsAt: program.StartsAt, EndsAt: program.EndsAt}
+	_ = a.store.Save(domain.Entity{ID: "recording-" + shortHash(program.AiringID), Plugin: PluginID, DeviceID: "television", Type: "tv_recording", Name: program.Title, Commands: []string{"tv_record_cancel"}, State: recording})
+}
+
+func (a *App) cancelTVRecording(addr messenger.Address) {
+	raw, err := a.store.Get(domain.EntityKey{Plugin: PluginID, DeviceID: addr.DeviceID, ID: addr.EntityID})
+	if err != nil {
+		return
+	}
+	var envelope struct {
+		State json.RawMessage `json:"state"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return
+	}
+	var recording domain.TVRecording
+	if json.Unmarshal(envelope.State, &recording) != nil || recording.ExternalID == "" {
+		return
+	}
+	parts := strings.Split(recording.ExternalID, ".")
+	if len(parts) < 3 {
+		return
+	}
+	key := domain.EntityKey{Plugin: parts[0], DeviceID: parts[1], ID: strings.Join(parts[2:], ".")}
+	if err := a.scheduler.DisableTimer(key); err != nil {
+		log.Printf("plugin-hdhomerun: cancel recording: %v", err)
+		return
+	}
+	recording.Status = "canceled"
+	_ = a.store.Save(domain.Entity{ID: addr.EntityID, Plugin: PluginID, DeviceID: addr.DeviceID, Type: "tv_recording", Name: recording.Program.Title, Commands: []string{"tv_record_cancel"}, State: recording})
 }
 
 func (a *App) selectRecorder(start, end time.Time) string {

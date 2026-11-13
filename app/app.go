@@ -327,6 +327,8 @@ func (a *App) handleCommand(addr messenger.Address, cmd any) {
 		a.createSeriesRule(key, c)
 	case domain.TVRecordAiring:
 		a.recordAiring(key, c.AiringID)
+	case domain.TVRecordCancel:
+		a.cancelTVRecording(addr)
 	case domain.SelectOption:
 		if addr.EntityID == "channel" {
 			a.selected[addr.DeviceID] = c.Option
