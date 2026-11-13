@@ -120,7 +120,7 @@ func (a *App) createAiringTimer(channelKey string, program *domain.TVProgram, pr
 	}
 	channel := a.channelStates[channelKey]
 	recording := domain.TVRecording{Status: "scheduled", Provider: PluginID, ExternalID: timerKey.Key(), Channel: channel, Program: *program, StartsAt: program.StartsAt, EndsAt: program.EndsAt}
-	_ = a.store.Save(domain.Entity{ID: "recording-" + shortHash(program.AiringID), Plugin: PluginID, DeviceID: "television", Type: "tv_recording", Name: program.Title, Commands: []string{"tv_record_cancel"}, State: recording})
+	_ = a.store.Save(domain.Entity{ID: "scheduled-" + shortHash(program.AiringID), Plugin: PluginID, DeviceID: recordingsDeviceID, Type: "tv_recording", Name: program.Title, Commands: []string{"tv_record_cancel"}, State: recording})
 }
 
 func (a *App) cancelTVRecording(addr messenger.Address) {

@@ -11,6 +11,7 @@ type config struct {
 	RecordingDir string
 	Profile      string
 	XMLTVURL     string
+	GuideEmail   string
 	Refresh      time.Duration
 }
 
@@ -27,7 +28,7 @@ func loadConfig() config {
 	if profile == "" {
 		profile = "universal-mp4"
 	}
-	return config{Devices: devices, RecordingDir: dir, Profile: profile, XMLTVURL: os.Getenv("HDHOMERUN_XMLTV_URL"), Refresh: 10 * time.Minute}
+	return config{Devices: devices, RecordingDir: dir, Profile: profile, XMLTVURL: os.Getenv("HDHOMERUN_XMLTV_URL"), GuideEmail: strings.TrimSpace(os.Getenv("HDHOMERUN_GUIDE_EMAIL")), Refresh: 10 * time.Minute}
 }
 
 func splitCSV(value string) []string {

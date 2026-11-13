@@ -1,9 +1,11 @@
 package app
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -44,13 +46,14 @@ type App struct {
 	recorders     []string
 	selected      map[string]string
 	sessions      map[string]*recordingSession
-	deviceAuth    []string
+	deviceAuth    map[string]string
+	deviceIDs     map[string]struct{}
 	guideData     *guide.Data
 	nextGuide     time.Time
 }
 
 func New() *App {
-	return &App{client: hdhr.New(), channels: map[string]hdhr.Channel{}, channelStates: map[string]domain.TVChannel{}, programs: map[string][]domain.TVProgram{}, sessions: map[string]*recordingSession{}, selected: map[string]string{}}
+	return &App{client: hdhr.New(), channels: map[string]hdhr.Channel{}, channelStates: map[string]domain.TVChannel{}, programs: map[string][]domain.TVProgram{}, sessions: map[string]*recordingSession{}, selected: map[string]string{}, deviceAuth: map[string]string{}, deviceIDs: map[string]struct{}{}}
 }
 
 func (a *App) Hello() contract.HelloResponse {
@@ -155,10 +158,13 @@ func (a *App) reconcile(ctx context.Context) error {
 
 func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 	_ = a.store.Save(a.healthyDevice(domain.Device{ID: d.DeviceID, Plugin: PluginID, Name: d.FriendlyName, Meta: map[string]json.RawMessage{"model": jsonString(d.ModelNumber)}}))
+	a.deviceIDs[d.DeviceID] = struct{}{}
 	if d.DeviceAuth != "" {
-		a.deviceAuth = appendUnique(a.deviceAuth, d.DeviceAuth)
+		a.deviceAuth[d.DeviceID] = d.DeviceAuth
+	} else {
+		delete(a.deviceAuth, d.DeviceID)
 	}
-	_ = a.store.Save(a.healthyDevice(domain.Device{ID: "television", Plugin: PluginID, Name: "Television"}))
+	_ = a.store.Save(a.healthyDevice(domain.Device{ID: recordingsDeviceID, Plugin: PluginID, Name: "Recordings"}))
 	for i := 0; i < d.TunerCount; i++ {
 		deviceID := fmt.Sprintf("%s-tuner%d", strings.ToLower(d.DeviceID), i)
 		key := PluginID + "." + deviceID + ".recording"
@@ -173,7 +179,7 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 					active := a.sessions[key] != nil
 					a.mu.Unlock()
 					if state.Power && !active {
-						a.markInterrupted(state.FileDeviceID)
+						a.markInterrupted(state.FileEntityKey)
 						state = domain.RecordingSwitch{LastError: "recording interrupted by restart"}
 					}
 					entity.State = state
@@ -185,7 +191,7 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 	}
 	for _, ch := range lineup {
 		id := "channel-" + safeID(ch.GuideNumber)
-		key := PluginID + ".television." + id
+		key := PluginID + "." + d.DeviceID + "." + id
 		state := domain.TVChannel{
 			Number: ch.GuideNumber, Name: ch.GuideName, Available: true,
 			DRM: strings.Contains(ch.Tags, "drm"), HD: ch.HD != 0,
@@ -194,7 +200,7 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 		}
 		a.channels[key] = ch
 		a.channelStates[key] = state
-		_ = a.store.Save(domain.Entity{ID: id, Plugin: PluginID, DeviceID: "television", Type: "tv_channel", Name: ch.GuideNumber + " " + ch.GuideName, Commands: []string{"tv_record_current", "tv_record_airing", "tv_record_series"}, State: state})
+		_ = a.store.Save(channelEntity(key, state))
 	}
 	options := make([]string, 0, len(lineup))
 	for _, ch := range lineup {
@@ -216,11 +222,15 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 	sort.Strings(a.recorders)
 }
 
-func (a *App) markInterrupted(fileDeviceID string) {
-	if fileDeviceID == "" {
+func (a *App) markInterrupted(fileEntityKey string) {
+	if fileEntityKey == "" {
 		return
 	}
-	raw, err := a.store.Get(domain.EntityKey{Plugin: PluginID, DeviceID: fileDeviceID, ID: "file"})
+	parts := strings.SplitN(fileEntityKey, ".", 3)
+	if len(parts) != 3 || parts[0] != PluginID || parts[1] != recordingsDeviceID {
+		return
+	}
+	raw, err := a.store.Get(domain.EntityKey{Plugin: parts[0], DeviceID: parts[1], ID: parts[2]})
 	if err != nil {
 		return
 	}
@@ -244,10 +254,7 @@ func (a *App) refreshGuide(ctx context.Context) error {
 	if a.guideData != nil && time.Now().Before(a.nextGuide) {
 		return a.applyGuide(*a.guideData)
 	}
-	guideURL := a.config.XMLTVURL
-	if guideURL == "" && len(a.deviceAuth) > 0 {
-		guideURL = "https://api.hdhomerun.com/api/xmltv?DeviceAuth=" + url.QueryEscape(strings.Join(a.deviceAuth, ""))
-	}
+	guideURL := a.guideURL()
 	if guideURL == "" {
 		return nil
 	}
@@ -255,21 +262,73 @@ func (a *App) refreshGuide(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := a.client.HTTP.Do(req)
 	if err != nil {
+		a.applyGuideError(err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("guide HTTP %d", resp.StatusCode)
+		err := fmt.Errorf("guide HTTP %d", resp.StatusCode)
+		a.applyGuideError(err.Error())
+		return err
 	}
-	data, err := guide.Parse(resp.Body)
+	var body = io.Reader(resp.Body)
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gz, gzipErr := gzip.NewReader(resp.Body)
+		if gzipErr != nil {
+			a.applyGuideError(gzipErr.Error())
+			return gzipErr
+		}
+		defer gz.Close()
+		body = gz
+	}
+	data, err := guide.Parse(body)
 	if err != nil {
+		a.applyGuideError(err.Error())
 		return err
 	}
 	a.guideData = &data
 	a.nextGuide = time.Now().Add(time.Duration(20+rand.IntN(9)) * time.Hour)
 	return a.applyGuide(data)
+}
+
+func (a *App) guideURL() string {
+	if a.config.XMLTVURL != "" {
+		return a.config.XMLTVURL
+	}
+	ids := make([]string, 0, len(a.deviceIDs))
+	for id := range a.deviceIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if a.config.GuideEmail != "" && len(ids) > 0 {
+		return "https://api.hdhomerun.com/api/xmltv?Email=" + url.QueryEscape(a.config.GuideEmail) + "&DeviceID=" + url.QueryEscape(strings.Join(ids, ","))
+	}
+	auth := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if value := a.deviceAuth[id]; value != "" {
+			auth = append(auth, value)
+		}
+	}
+	if len(auth) == 0 {
+		return ""
+	}
+	return "https://api.hdhomerun.com/api/xmltv?DeviceAuth=" + url.QueryEscape(strings.Join(auth, ""))
+}
+
+func (a *App) applyGuideError(message string) {
+	for key, state := range a.channelStates {
+		state.GuideError = message
+		a.channelStates[key] = state
+		_ = a.store.Save(channelEntity(key, state))
+	}
+}
+
+func channelEntity(key string, state domain.TVChannel) domain.Entity {
+	parts := strings.SplitN(key, ".", 3)
+	return domain.Entity{ID: parts[2], Plugin: parts[0], DeviceID: parts[1], Type: "tv_channel", Name: state.Number + " " + state.Name, Commands: []string{"tv_record_current", "tv_record_airing", "tv_record_series"}, State: state}
 }
 
 func (a *App) applyGuide(data guide.Data) error {
@@ -300,8 +359,7 @@ func (a *App) applyGuide(data guide.Data) error {
 		}
 		a.channelStates[key] = state
 		a.programs[key] = matched
-		parts := strings.Split(key, ".")
-		_ = a.store.Save(domain.Entity{ID: parts[2], Plugin: PluginID, DeviceID: "television", Type: "tv_channel", Name: state.Number + " " + state.Name, Commands: []string{"tv_record_current", "tv_record_airing", "tv_record_series"}, State: state})
+		_ = a.store.Save(channelEntity(key, state))
 	}
 	return a.materializeRules(now)
 }

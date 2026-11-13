@@ -20,7 +20,8 @@ func (a *App) Guide(req media.GuideRequest) media.GuidePage {
 	channels := []media.GuideChannel{}
 	programs := []domain.TVProgram{}
 	for key, state := range a.channelStates {
-		if req.ServerID != "" && req.ServerID != "television" {
+		parts := strings.SplitN(key, ".", 3)
+		if req.ServerID != "" && (len(parts) < 3 || req.ServerID != parts[1]) {
 			continue
 		}
 		if req.Channel != "" && req.Channel != state.Number && req.Channel != key {

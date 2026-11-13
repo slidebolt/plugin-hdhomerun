@@ -62,3 +62,9 @@ func TestUniversalProfileHasMP4Extension(t *testing.T) {
 		t.Fatalf("fileExt: got %q want mp4", got)
 	}
 }
+
+func TestRecordingEntityUsesStableRecordingsDevice(t *testing.T) {
+	if got := recordingEntityKey("recording-123"); got != "plugin-hdhomerun.recordings.recording-123" {
+		t.Fatalf("recording entity key: got %q", got)
+	}
+}
