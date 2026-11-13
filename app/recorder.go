@@ -235,7 +235,7 @@ func universalArgs(source, output string) []string {
 		"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
 		"-vf", "bwdif=mode=send_frame:parity=auto:deint=interlaced,scale=w='min(iw,1920)':h='min(ih,1080)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
 		"-c:v", "libx264", "-preset", "medium", "-crf", "22", "-pix_fmt", "yuv420p", "-profile:v", "high", "-level:v", "4.1",
-		"-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000", "-movflags", "+faststart", output,
+		"-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000", "-movflags", "+faststart", "-f", "mp4", output,
 	}
 }
 

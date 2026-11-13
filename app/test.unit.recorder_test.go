@@ -41,7 +41,9 @@ func TestUniversalProfileProducesValidatedMP4(t *testing.T) {
 	}
 	dir := t.TempDir()
 	source := filepath.Join(dir, "source.ts")
-	output := filepath.Join(dir, "output.mp4")
+	// Production encodes to an atomic partial name before publishing the MP4.
+	// Keep this suffix here so the test proves the muxer is selected explicitly.
+	output := filepath.Join(dir, "output.mp4.partial")
 	makeSource := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=1", "-f", "lavfi", "-i", "sine=frequency=1000:duration=1", "-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts", source)
 	if out, err := makeSource.CombinedOutput(); err != nil {
 		t.Fatalf("make source: %v: %s", err, out)
