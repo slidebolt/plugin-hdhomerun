@@ -17,6 +17,7 @@ import (
 	"github.com/slidebolt/plugin-hdhomerun/internal/hdhr"
 	contract "github.com/slidebolt/sb-contract"
 	domain "github.com/slidebolt/sb-domain"
+	media "github.com/slidebolt/sb-media-sdk"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	scheduler "github.com/slidebolt/sb-scheduler-sdk"
 	storage "github.com/slidebolt/sb-storage-sdk"
@@ -73,6 +74,11 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 		return nil, err
 	}
 	a.subs = append(a.subs, sub)
+	providerSubs, err := media.ServeProvider(msg, PluginID, a)
+	if err != nil {
+		return nil, err
+	}
+	a.subs = append(a.subs, providerSubs...)
 	a.ctx, a.cancel = context.WithCancel(context.Background())
 	if err := a.reconcile(a.ctx); err != nil {
 		log.Printf("plugin-hdhomerun: initial reconcile: %v", err)
@@ -188,7 +194,7 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 		}
 		a.channels[key] = ch
 		a.channelStates[key] = state
-		_ = a.store.Save(domain.Entity{ID: id, Plugin: PluginID, DeviceID: "television", Type: "tv_channel", Name: ch.GuideNumber + " " + ch.GuideName, Commands: []string{"tv_record_current", "tv_record_series"}, State: state})
+		_ = a.store.Save(domain.Entity{ID: id, Plugin: PluginID, DeviceID: "television", Type: "tv_channel", Name: ch.GuideNumber + " " + ch.GuideName, Commands: []string{"tv_record_current", "tv_record_airing", "tv_record_series"}, State: state})
 	}
 	options := make([]string, 0, len(lineup))
 	for _, ch := range lineup {
@@ -295,7 +301,7 @@ func (a *App) applyGuide(data guide.Data) error {
 		a.channelStates[key] = state
 		a.programs[key] = matched
 		parts := strings.Split(key, ".")
-		_ = a.store.Save(domain.Entity{ID: parts[2], Plugin: PluginID, DeviceID: "television", Type: "tv_channel", Name: state.Number + " " + state.Name, Commands: []string{"tv_record_current", "tv_record_series"}, State: state})
+		_ = a.store.Save(domain.Entity{ID: parts[2], Plugin: PluginID, DeviceID: "television", Type: "tv_channel", Name: state.Number + " " + state.Name, Commands: []string{"tv_record_current", "tv_record_airing", "tv_record_series"}, State: state})
 	}
 	return a.materializeRules(now)
 }
@@ -319,10 +325,22 @@ func (a *App) handleCommand(addr messenger.Address, cmd any) {
 		a.recordCurrent(key, c)
 	case domain.TVRecordSeries:
 		a.createSeriesRule(key, c)
+	case domain.TVRecordAiring:
+		a.recordAiring(key, c.AiringID)
 	case domain.SelectOption:
 		if addr.EntityID == "channel" {
 			a.selected[addr.DeviceID] = c.Option
 			_ = a.store.Save(domain.Entity{ID: "channel", Plugin: PluginID, DeviceID: addr.DeviceID, Type: "select", Name: "Channel", Commands: []string{"select_option"}, State: domain.Select{Option: c.Option}})
+		}
+	}
+}
+
+func (a *App) recordAiring(channelKey, airingID string) {
+	for i := range a.programs[channelKey] {
+		p := a.programs[channelKey][i]
+		if p.AiringID == airingID {
+			a.createAiringTimer(channelKey, &p, a.config.Profile)
+			return
 		}
 	}
 }
