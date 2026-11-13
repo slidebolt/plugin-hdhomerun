@@ -24,7 +24,7 @@ github.com/slidebolt/sb-messenger-sdk v1.0.8 h1:M5uM3l8f9lDs/5HcAlOgO+Jovs8qVM9f
 github.com/slidebolt/sb-messenger-sdk v1.0.8/go.mod h1:yJxHiUgqcO/TUj9yiPkVyTwrN0/3BBy6HD17TdWPCEA=
 github.com/slidebolt/sb-runtime v1.0.6 h1:Kxdgvx4FGiC7NvE+S/QtVituyqBh+Typmop8TzVNKo4=
 github.com/slidebolt/sb-runtime v1.0.6/go.mod h1:094+7ODH66/fYjC8PSmuw1skJpML2hwrb/vXl3Zs9uw=
-github.com/slidebolt/sb-scheduler-sdk v0.1.0 h1:Vrr7LZrjW79T5PJIxnug8vsr+w77CBz0/eo1e75i3+M=
+github.com/slidebolt/sb-scheduler-sdk v0.1.0 h1:jXM4fWE8RQpnRdk/kSVk55t506iF1AutBxzUNkkOH8M=
 github.com/slidebolt/sb-scheduler-sdk v0.1.0/go.mod h1:Hm8wXMKWvmUrMvfzWKJ03+78RmNk2XbMWSAAQzciUWc=
 github.com/slidebolt/sb-storage-sdk v1.0.8 h1:ikDWXrzHKYkAqqYKizGp7iLbqS6ReWwdIcuawHWP98c=
 github.com/slidebolt/sb-storage-sdk v1.0.8/go.mod h1:vDH/pMc8JmpEcB25ulgXheDyQpSl6ZlUIHAxTWuGVV8=
