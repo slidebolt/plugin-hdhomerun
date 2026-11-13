@@ -143,6 +143,17 @@ func (a *App) cancelTVRecording(addr messenger.Address) {
 		return
 	}
 	key := domain.EntityKey{Plugin: parts[0], DeviceID: parts[1], ID: strings.Join(parts[2:], ".")}
+	if timerRaw, getErr := a.store.Get(key); getErr == nil {
+		var timerEntity domain.Entity
+		if json.Unmarshal(timerRaw, &timerEntity) == nil {
+			if timer, ok := timerEntity.State.(domain.Timer); ok && timer.Target != "" {
+				targetParts := strings.Split(timer.Target, ".")
+				if len(targetParts) >= 3 {
+					_ = a.cmds.Send(domain.EntityKey{Plugin: targetParts[0], DeviceID: targetParts[1], ID: strings.Join(targetParts[2:], ".")}, domain.SwitchTurnOff{})
+				}
+			}
+		}
+	}
 	if err := a.scheduler.DisableTimer(key); err != nil {
 		log.Printf("plugin-hdhomerun: cancel recording: %v", err)
 		return
