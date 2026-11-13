@@ -154,16 +154,16 @@ func (a *App) reconcile(ctx context.Context) error {
 }
 
 func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
-	_ = a.store.Save(domain.Device{ID: d.DeviceID, Plugin: PluginID, Name: d.FriendlyName, Meta: map[string]json.RawMessage{"model": jsonString(d.ModelNumber)}})
+	_ = a.store.Save(a.healthyDevice(domain.Device{ID: d.DeviceID, Plugin: PluginID, Name: d.FriendlyName, Meta: map[string]json.RawMessage{"model": jsonString(d.ModelNumber)}}))
 	if d.DeviceAuth != "" {
 		a.deviceAuth = appendUnique(a.deviceAuth, d.DeviceAuth)
 	}
-	_ = a.store.Save(domain.Device{ID: "television", Plugin: PluginID, Name: "Television"})
+	_ = a.store.Save(a.healthyDevice(domain.Device{ID: "television", Plugin: PluginID, Name: "Television"}))
 	for i := 0; i < d.TunerCount; i++ {
 		deviceID := fmt.Sprintf("%s-tuner%d", strings.ToLower(d.DeviceID), i)
 		key := PluginID + "." + deviceID + ".recording"
-		_ = a.store.Save(domain.Device{ID: deviceID, Plugin: PluginID, Name: fmt.Sprintf("%s Tuner %d", d.FriendlyName, i+1)})
-		_ = a.store.Save(domain.Entity{ID: "tuner", Plugin: PluginID, DeviceID: deviceID, Type: "tv_tuner", Name: "Tuner", State: domain.TVTuner{Available: true, DeviceID: d.DeviceID, Model: d.ModelNumber, Tuner: i}})
+		_ = a.store.Save(a.healthyDevice(domain.Device{ID: deviceID, Plugin: PluginID, Name: fmt.Sprintf("%s Tuner %d", d.FriendlyName, i+1)}))
+		_ = a.store.Save(a.healthyEntity(domain.Entity{ID: "tuner", Plugin: PluginID, DeviceID: deviceID, Type: "tv_tuner", Name: "Tuner", State: domain.TVTuner{Available: true, DeviceID: d.DeviceID, Model: d.ModelNumber, Tuner: i}}))
 		entity := domain.Entity{ID: "recording", Plugin: PluginID, DeviceID: deviceID, Type: "recording_switch", Name: "Recording", Commands: []string{"switch_turn_on", "switch_turn_off"}, State: domain.RecordingSwitch{}}
 		if raw, err := a.store.Get(domain.EntityKey{Plugin: PluginID, DeviceID: deviceID, ID: "recording"}); err == nil {
 			var old domain.Entity
