@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	domain "github.com/slidebolt/sb-domain"
+	storage "github.com/slidebolt/sb-storage-sdk"
 )
 
 type recordingSession struct {
@@ -24,40 +25,73 @@ type recordingSession struct {
 	stopping atomic.Bool
 }
 
+type recordingStatus string
+
+const (
+	recordingStatusRecording recordingStatus = "recording"
+	recordingStatusEncoding  recordingStatus = "processing"
+	recordingStatusCompleted recordingStatus = "ready"
+	recordingStatusFailed    recordingStatus = "failed"
+)
+
+type recordingRecord struct {
+	ID                 string            `json:"id"`
+	Status             recordingStatus   `json:"status"`
+	RelativePath       string            `json:"relativePath"`
+	PartialPath        string            `json:"partialPath,omitempty"`
+	Format             string            `json:"format"`
+	Profile            string            `json:"profile"`
+	Channel            domain.TVChannel  `json:"channel"`
+	Program            *domain.TVProgram `json:"program,omitempty"`
+	StartedAt          time.Time         `json:"startedAt"`
+	FinishedAt         *time.Time        `json:"finishedAt,omitempty"`
+	EncodingStartedAt  *time.Time        `json:"encodingStartedAt,omitempty"`
+	EncodingFinishedAt *time.Time        `json:"encodingFinishedAt,omitempty"`
+	SourceBytes        int64             `json:"sourceBytes,omitempty"`
+	BytesWritten       int64             `json:"bytesWritten"`
+	Error              string            `json:"error,omitempty"`
+}
+type recordingKey string
+
+func (k recordingKey) Key() string { return PluginID + ".recordings." + string(k) }
+
 const recordingsDeviceID = "recordings"
 
 func (s *recordingSession) stop() { s.stopping.Store(true); s.cancel() }
 
-func (a *App) startRecording(recorderKey string, cmd domain.SwitchTurnOn) {
+func (a *App) startRecording(recorderKey string, cmd domain.RecordStart) {
 	a.mu.Lock()
 	if a.sessions[recorderKey] != nil {
 		a.mu.Unlock()
 		return
 	}
 	a.mu.Unlock()
-	var input domain.RecordingStartInput
-	_ = json.Unmarshal(cmd.Input, &input)
-	if input.ChannelKey == "" {
+	channelKey := cmd.Source.Entity
+	var program *domain.TVProgram
+	if raw := cmd.Metadata["program"]; len(raw) > 0 {
+		_ = json.Unmarshal(raw, &program)
+	}
+	if channelKey == "" {
 		parts := strings.Split(recorderKey, ".")
 		if len(parts) == 3 {
 			number := a.selected[parts[1]]
 			for key, state := range a.channelStates {
 				if state.Number == number {
-					input.ChannelKey = key
+					channelKey = key
 					break
 				}
 			}
 		}
 	}
-	if input.ChannelKey == "" {
+	if channelKey == "" {
 		return
 	}
-	channel, ok := a.channels[input.ChannelKey]
+	channel, ok := a.channels[channelKey]
 	if !ok || strings.Contains(channel.Tags, "drm") {
 		return
 	}
-	state := a.channelStates[input.ChannelKey]
-	profile := input.Profile
+	state := a.channelStates[channelKey]
+	profile := cmd.Profile
 	if profile == "" {
 		profile = a.config.Profile
 	}
@@ -73,7 +107,7 @@ func (a *App) startRecording(recorderKey string, cmd domain.SwitchTurnOn) {
 	a.mu.Unlock()
 	start := time.Now().UTC()
 	fileID := fmt.Sprintf("recording-%s-%d", start.Format("20060102-150405"), start.UnixNano()%100000)
-	rel := recordingPath(input.Program, state, profile, start)
+	rel := recordingPath(program, state, profile, start)
 	ext := filepath.Ext(rel)
 	rel = strings.TrimSuffix(rel, ext) + "-" + shortHash(fileID) + ext
 	partial := rel + ".partial"
@@ -86,14 +120,16 @@ func (a *App) startRecording(recorderKey string, cmd domain.SwitchTurnOn) {
 		a.failStart(recorderKey, err)
 		return
 	}
-	fileState := domain.RecordingFile{Status: domain.RecordingStatusRecording, RelativePath: rel, PartialPath: partial, Format: fileExt(profile), Profile: profile, Channel: state, Program: input.Program, StartedAt: start}
+	fileState := recordingRecord{ID: fileID, Status: recordingStatusRecording, RelativePath: rel, PartialPath: partial, Format: fileExt(profile), Profile: profile, Channel: state, Program: program, StartedAt: start}
 	_ = a.saveRecordingFile(fileID, fileState)
-	a.saveRecorder(recorderKey, domain.RecordingSwitch{Power: true, ChannelKey: input.ChannelKey, Program: input.Program, FileEntityKey: recordingEntityKey(fileID), StartedAt: &start})
+	output := mediaItemRef(fileID)
+	source := cmd.Source
+	a.saveRecorder(recorderKey, domain.Recorder{Status: "recording", Source: &source, Output: &output, StartedAt: &start})
 	a.wg.Add(1)
 	go a.capture(ctx, session, recorderKey, fileID, channel.URL, partialAbs, finalAbs, fileState)
 }
 
-func (a *App) capture(ctx context.Context, session *recordingSession, recorderKey, fileID, streamURL, partialAbs, finalAbs string, state domain.RecordingFile) {
+func (a *App) capture(ctx context.Context, session *recordingSession, recorderKey, fileID, streamURL, partialAbs, finalAbs string, state recordingRecord) {
 	defer a.wg.Done()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err == nil {
@@ -127,20 +163,20 @@ func (a *App) capture(ctx context.Context, session *recordingSession, recorderKe
 		state.BytesWritten = info.Size()
 	}
 	if err != nil && !session.stopping.Load() {
-		state.Status = domain.RecordingStatusFailed
+		state.Status = recordingStatusFailed
 		state.Error = err.Error()
 	} else if err != nil {
-		state.Status = domain.RecordingStatusFailed
+		state.Status = recordingStatusFailed
 		state.Error = err.Error()
 	} else {
-		state.Status = domain.RecordingStatusCompleted
+		state.Status = recordingStatusCompleted
 		state.PartialPath = ""
 	}
 	_ = a.saveRecordingFile(fileID, state)
 	a.mu.Lock()
 	delete(a.sessions, recorderKey)
 	a.mu.Unlock()
-	a.saveRecorder(recorderKey, domain.RecordingSwitch{LastError: state.Error})
+	a.saveRecorder(recorderKey, domain.Recorder{Status: map[bool]string{true: "error", false: "idle"}[state.Error != ""], LastError: state.Error})
 }
 
 func copyStream(src io.Reader, path string) error {
@@ -156,17 +192,17 @@ func copyStream(src io.Reader, path string) error {
 	return closeErr
 }
 
-func (a *App) finishCaptureForEncoding(session *recordingSession, recorderKey, fileID, partialAbs, finalAbs string, state domain.RecordingFile, captureErr error) {
+func (a *App) finishCaptureForEncoding(session *recordingSession, recorderKey, fileID, partialAbs, finalAbs string, state recordingRecord, captureErr error) {
 	a.mu.Lock()
 	delete(a.sessions, recorderKey)
 	a.mu.Unlock()
-	a.saveRecorder(recorderKey, domain.RecordingSwitch{})
+	a.saveRecorder(recorderKey, domain.Recorder{Status: "processing"})
 
 	// Canceling is the normal way a timer or person ends a recording. The bytes
 	// already written are a complete transport-stream capture and can be encoded.
 	if captureErr != nil && !session.stopping.Load() {
 		now := time.Now().UTC()
-		state.Status, state.Error, state.FinishedAt = domain.RecordingStatusFailed, captureErr.Error(), &now
+		state.Status, state.Error, state.FinishedAt = recordingStatusFailed, captureErr.Error(), &now
 		if info, err := os.Stat(partialAbs); err == nil {
 			state.SourceBytes = info.Size()
 		}
@@ -176,7 +212,7 @@ func (a *App) finishCaptureForEncoding(session *recordingSession, recorderKey, f
 	capturedAbs := strings.TrimSuffix(partialAbs, ".partial")
 	if err := os.Rename(partialAbs, capturedAbs); err != nil {
 		now := time.Now().UTC()
-		state.Status, state.Error, state.FinishedAt = domain.RecordingStatusFailed, err.Error(), &now
+		state.Status, state.Error, state.FinishedAt = recordingStatusFailed, err.Error(), &now
 		_ = a.saveRecordingFile(fileID, state)
 		return
 	}
@@ -186,11 +222,11 @@ func (a *App) finishCaptureForEncoding(session *recordingSession, recorderKey, f
 			err = fmt.Errorf("empty capture")
 		}
 		now := time.Now().UTC()
-		state.Status, state.Error, state.FinishedAt = domain.RecordingStatusFailed, err.Error(), &now
+		state.Status, state.Error, state.FinishedAt = recordingStatusFailed, err.Error(), &now
 		_ = a.saveRecordingFile(fileID, state)
 		return
 	}
-	state.Status = domain.RecordingStatusEncoding
+	state.Status = recordingStatusEncoding
 	state.PartialPath = strings.TrimSuffix(state.PartialPath, ".partial")
 	state.SourceBytes = info.Size()
 	state.Error = ""
@@ -198,7 +234,7 @@ func (a *App) finishCaptureForEncoding(session *recordingSession, recorderKey, f
 	a.encodeUniversal(fileID, capturedAbs, finalAbs, state)
 }
 
-func (a *App) encodeUniversal(fileID, sourceAbs, finalAbs string, state domain.RecordingFile) {
+func (a *App) encodeUniversal(fileID, sourceAbs, finalAbs string, state recordingRecord) {
 	a.encodeMu.Lock()
 	defer a.encodeMu.Unlock()
 	if err := a.ctx.Err(); err != nil {
@@ -219,10 +255,10 @@ func (a *App) encodeUniversal(fileID, sourceAbs, finalAbs string, state domain.R
 	finished := time.Now().UTC()
 	state.EncodingFinishedAt, state.FinishedAt = &finished, &finished
 	if err != nil {
-		state.Status, state.Error = domain.RecordingStatusFailed, "encode: "+err.Error()
+		state.Status, state.Error = recordingStatusFailed, "encode: "+err.Error()
 		_ = os.Remove(outputPartial)
 	} else {
-		state.Status, state.Error, state.PartialPath = domain.RecordingStatusCompleted, "", ""
+		state.Status, state.Error, state.PartialPath = recordingStatusCompleted, "", ""
 		if info, statErr := os.Stat(finalAbs); statErr == nil {
 			state.BytesWritten = info.Size()
 		}
@@ -273,17 +309,16 @@ func validateUniversal(ctx context.Context, path string) error {
 }
 
 func (a *App) recoverEncodings() {
-	entries, err := a.store.Search(PluginID + "." + recordingsDeviceID + ".recording-*")
+	entries, err := a.store.SearchFiles(storage.Internal, PluginID+"."+recordingsDeviceID+".recording-*")
 	if err != nil {
 		return
 	}
 	for _, entry := range entries {
-		var entity domain.Entity
-		if json.Unmarshal(entry.Data, &entity) != nil {
+		var state recordingRecord
+		if json.Unmarshal(entry.Data, &state) != nil {
 			continue
 		}
-		state, ok := entity.State.(domain.RecordingFile)
-		if !ok || state.Status != domain.RecordingStatusEncoding || state.PartialPath == "" {
+		if state.Status != recordingStatusEncoding || state.PartialPath == "" {
 			continue
 		}
 		sourceAbs := filepath.Join(a.config.RecordingDir, state.PartialPath)
@@ -291,7 +326,7 @@ func (a *App) recoverEncodings() {
 		if info, statErr := os.Stat(sourceAbs); statErr != nil || info.Size() == 0 {
 			continue
 		}
-		id := entity.ID
+		id := state.ID
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
@@ -337,20 +372,27 @@ func (a *App) failStart(key string, err error) {
 	a.mu.Lock()
 	delete(a.sessions, key)
 	a.mu.Unlock()
-	a.saveRecorder(key, domain.RecordingSwitch{LastError: err.Error()})
+	a.saveRecorder(key, domain.Recorder{Status: "error", LastError: err.Error()})
 }
-func (a *App) saveRecorder(key string, state domain.RecordingSwitch) {
+func (a *App) saveRecorder(key string, state domain.Recorder) {
 	parts := strings.Split(key, ".")
 	if len(parts) != 3 {
 		return
 	}
-	_ = a.store.Save(domain.Entity{ID: parts[2], Plugin: parts[0], DeviceID: parts[1], Type: "recording_switch", Name: "Recording", Commands: []string{"switch_turn_on", "switch_turn_off"}, State: state})
+	_ = a.store.Save(domain.Entity{ID: parts[2], Plugin: parts[0], DeviceID: parts[1], Type: "recorder", Name: "Recorder", Commands: []string{"record_start", "record_stop", "record_cancel", "recording_rule_create", "recording_rule_delete"}, State: state})
 }
-func (a *App) saveRecordingFile(id string, state domain.RecordingFile) error {
-	return a.store.Save(domain.Entity{ID: id, Plugin: PluginID, DeviceID: recordingsDeviceID, Type: "recording_file", Name: fileName(state), State: state})
+func (a *App) saveRecordingFile(id string, state recordingRecord) error {
+	state.ID = id
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return a.store.WriteFile(storage.Internal, recordingKey(id), data)
 }
-func recordingEntityKey(id string) string { return PluginID + "." + recordingsDeviceID + "." + id }
-func fileName(state domain.RecordingFile) string {
+func mediaItemRef(id string) domain.MediaItemRef {
+	return domain.MediaItemRef{Provider: PluginID, ServerID: recordingsDeviceID, LibraryID: recordingsDeviceID, ItemID: id}
+}
+func fileName(state recordingRecord) string {
 	if state.Program != nil && state.Program.Title != "" {
 		return state.Program.Title
 	}

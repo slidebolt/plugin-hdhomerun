@@ -57,7 +57,7 @@ func New() *App {
 }
 
 func (a *App) Hello() contract.HelloResponse {
-	return contract.HelloResponse{ID: PluginID, Kind: contract.KindPlugin, ContractVersion: contract.ContractVersion, DependsOn: []string{"messenger", "storage", "scheduler"}, Definitions: contract.DescribePlugin("HDHomeRun", "Discovers television tuners, guide channels, recording controls, and recording outputs.", "recording_file", "recording_switch", "select", "tv_channel", "tv_recording", "tv_recording_rule", "tv_tuner")}
+	return contract.HelloResponse{ID: PluginID, Kind: contract.KindPlugin, ContractVersion: contract.ContractVersion, DependsOn: []string{"messenger", "storage", "scheduler"}, Definitions: contract.DescribePlugin("HDHomeRun", "Discovers television sources and records them into provider-backed media items.", "media_library", "media_source", "recorder", "recording_rule", "select", "tv_channel", "tv_tuner")}
 }
 
 func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) {
@@ -165,22 +165,25 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 		delete(a.deviceAuth, d.DeviceID)
 	}
 	_ = a.store.Save(a.healthyDevice(domain.Device{ID: recordingsDeviceID, Plugin: PluginID, Name: "Recordings"}))
+	_ = a.store.Save(domain.Entity{ID: "library", Plugin: PluginID, DeviceID: recordingsDeviceID, Type: "media_library", Name: "Recordings", State: domain.MediaLibrary{ServerID: recordingsDeviceID, LibraryID: recordingsDeviceID, Kind: "mixed", CanBrowse: true, CanSearch: true}})
 	for i := 0; i < d.TunerCount; i++ {
 		deviceID := fmt.Sprintf("%s-tuner%d", strings.ToLower(d.DeviceID), i)
 		key := PluginID + "." + deviceID + ".recording"
 		_ = a.store.Save(a.healthyDevice(domain.Device{ID: deviceID, Plugin: PluginID, Name: fmt.Sprintf("%s Tuner %d", d.FriendlyName, i+1)}))
 		_ = a.store.Save(a.healthyEntity(domain.Entity{ID: "tuner", Plugin: PluginID, DeviceID: deviceID, Type: "tv_tuner", Name: "Tuner", State: domain.TVTuner{Available: true, DeviceID: d.DeviceID, Model: d.ModelNumber, Tuner: i}}))
-		entity := domain.Entity{ID: "recording", Plugin: PluginID, DeviceID: deviceID, Type: "recording_switch", Name: "Recording", Commands: []string{"switch_turn_on", "switch_turn_off"}, State: domain.RecordingSwitch{}}
+		entity := domain.Entity{ID: "recording", Plugin: PluginID, DeviceID: deviceID, Type: "recorder", Name: "Recorder", Commands: []string{"record_start", "record_stop", "record_cancel", "recording_rule_create", "recording_rule_delete"}, State: domain.Recorder{Status: "idle"}}
 		if raw, err := a.store.Get(domain.EntityKey{Plugin: PluginID, DeviceID: deviceID, ID: "recording"}); err == nil {
 			var old domain.Entity
 			if json.Unmarshal(raw, &old) == nil {
-				if state, ok := old.State.(domain.RecordingSwitch); ok {
+				if state, ok := old.State.(domain.Recorder); ok {
 					a.mu.Lock()
 					active := a.sessions[key] != nil
 					a.mu.Unlock()
-					if state.Power && !active {
-						a.markInterrupted(state.FileEntityKey)
-						state = domain.RecordingSwitch{LastError: "recording interrupted by restart"}
+					if (state.Status == "recording" || state.Status == "processing") && !active {
+						if state.Output != nil {
+							a.markInterrupted(state.Output.ItemID)
+						}
+						state = domain.Recorder{Status: "error", LastError: "recording interrupted by restart"}
 					}
 					entity.State = state
 				}
@@ -222,32 +225,23 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 	sort.Strings(a.recorders)
 }
 
-func (a *App) markInterrupted(fileEntityKey string) {
-	if fileEntityKey == "" {
+func (a *App) markInterrupted(id string) {
+	if id == "" {
 		return
 	}
-	parts := strings.SplitN(fileEntityKey, ".", 3)
-	if len(parts) != 3 || parts[0] != PluginID || parts[1] != recordingsDeviceID {
-		return
-	}
-	raw, err := a.store.Get(domain.EntityKey{Plugin: parts[0], DeviceID: parts[1], ID: parts[2]})
+	raw, err := a.store.ReadFile(storage.Internal, recordingKey(id))
 	if err != nil {
 		return
 	}
-	var entity domain.Entity
-	if json.Unmarshal(raw, &entity) != nil {
-		return
-	}
-	state, ok := entity.State.(domain.RecordingFile)
-	if !ok {
+	var state recordingRecord
+	if json.Unmarshal(raw, &state) != nil {
 		return
 	}
 	now := time.Now().UTC()
-	state.Status = domain.RecordingStatusFailed
+	state.Status = recordingStatusFailed
 	state.Error = "recording interrupted by restart"
 	state.FinishedAt = &now
-	entity.State = state
-	_ = a.store.Save(entity)
+	_ = a.saveRecordingFile(id, state)
 }
 
 func (a *App) refreshGuide(ctx context.Context) error {
@@ -328,7 +322,7 @@ func (a *App) applyGuideError(message string) {
 
 func channelEntity(key string, state domain.TVChannel) domain.Entity {
 	parts := strings.SplitN(key, ".", 3)
-	return domain.Entity{ID: parts[2], Plugin: parts[0], DeviceID: parts[1], Type: "tv_channel", Name: state.Number + " " + state.Name, Commands: []string{"tv_record_current", "tv_record_airing", "tv_record_series"}, State: state}
+	return domain.Entity{ID: parts[2], Plugin: parts[0], DeviceID: parts[1], Type: "tv_channel", Name: state.Number + " " + state.Name, State: state}
 }
 
 func (a *App) applyGuide(data guide.Data) error {
@@ -367,62 +361,23 @@ func (a *App) applyGuide(data guide.Data) error {
 func (a *App) handleCommand(addr messenger.Address, cmd any) {
 	key := addr.Key()
 	switch c := cmd.(type) {
-	case domain.SwitchTurnOn:
-		if addr.DeviceID == "recording-rules" {
-			a.setRuleEnabled(addr.EntityID, true)
-		} else {
-			a.startRecording(key, c)
+	case domain.RecordStart:
+		a.startRecording(key, c)
+	case domain.RecordStop, domain.RecordCancel:
+		a.stopRecording(key)
+	case domain.RecordingRuleCreate:
+		if err := a.createRecordingRule(addr, c); err != nil {
+			log.Printf("plugin-hdhomerun: create recording rule: %v", err)
 		}
-	case domain.SwitchTurnOff:
-		if addr.DeviceID == "recording-rules" {
-			a.setRuleEnabled(addr.EntityID, false)
-		} else {
-			a.stopRecording(key)
+	case domain.RecordingRuleDelete:
+		if err := a.deleteRecordingRule(c.Reference); err != nil {
+			log.Printf("plugin-hdhomerun: delete recording rule: %v", err)
 		}
-	case domain.TVRecordCurrent:
-		a.recordCurrent(key, c)
-	case domain.TVRecordSeries:
-		a.createSeriesRule(key, c)
-	case domain.TVRecordAiring:
-		a.recordAiring(key, c.AiringID)
-	case domain.TVRecordCancel:
-		a.cancelTVRecording(addr)
 	case domain.SelectOption:
 		if addr.EntityID == "channel" {
 			a.selected[addr.DeviceID] = c.Option
 			_ = a.store.Save(domain.Entity{ID: "channel", Plugin: PluginID, DeviceID: addr.DeviceID, Type: "select", Name: "Channel", Commands: []string{"select_option"}, State: domain.Select{Option: c.Option}})
 		}
-	}
-}
-
-func (a *App) recordAiring(channelKey, airingID string) {
-	for i := range a.programs[channelKey] {
-		p := a.programs[channelKey][i]
-		if p.AiringID == airingID {
-			a.createAiringTimer(channelKey, &p, a.config.Profile)
-			return
-		}
-	}
-}
-
-func (a *App) recordCurrent(channelKey string, cmd domain.TVRecordCurrent) {
-	state, ok := a.channelStates[channelKey]
-	if !ok || state.CurrentProgram == nil {
-		return
-	}
-	recorder := cmd.Recorder
-	if recorder == "" && len(a.recorders) > 0 {
-		recorder = a.recorders[0]
-	}
-	if recorder == "" {
-		return
-	}
-	now := time.Now().Add(time.Second)
-	input, _ := json.Marshal(domain.RecordingStartInput{ChannelKey: channelKey, Program: state.CurrentProgram, Profile: a.config.Profile})
-	id := "airing-" + safeID(state.CurrentProgram.AiringID)
-	_, err := a.scheduler.CreateTimer(scheduler.CreateTimerRequest{ID: id, Name: state.CurrentProgram.Title, Timer: domain.Timer{Enabled: true, Target: recorder, Input: input, On: domain.TimerTrigger{Kind: "at", At: &now}, Off: domain.TimerTrigger{Kind: "at", At: &state.CurrentProgram.EndsAt}}})
-	if err != nil {
-		log.Printf("plugin-hdhomerun: schedule current: %v", err)
 	}
 }
 

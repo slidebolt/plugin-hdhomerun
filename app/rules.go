@@ -14,61 +14,39 @@ import (
 	scheduler "github.com/slidebolt/sb-scheduler-sdk"
 )
 
-func (a *App) createSeriesRule(channelKey string, cmd domain.TVRecordSeries) {
-	channel, ok := a.channelStates[channelKey]
-	if !ok || channel.CurrentProgram == nil || channel.CurrentProgram.SeriesID == "" {
-		return
+func (a *App) createRecordingRule(addr messenger.Address, cmd domain.RecordingRuleCreate) error {
+	rule := cmd.Rule
+	if rule.Recorder == "" {
+		rule.Recorder = addr.Key()
 	}
-	rule := domain.TVRecordingRule{Enabled: true, SeriesID: channel.CurrentProgram.SeriesID, Title: channel.CurrentProgram.Title, NewOnly: !cmd.IncludeRepeats, ChannelNumbers: []string{channel.Number}, Profile: a.config.Profile}
-	deviceID := "recording-rules"
-	id := "rule-" + shortHash(rule.SeriesID)
-	_ = a.store.Save(domain.Device{ID: deviceID, Plugin: PluginID, Name: "Recording Rules"})
-	_ = a.store.Save(domain.Entity{ID: id, Plugin: PluginID, DeviceID: deviceID, Type: "tv_recording_rule", Name: rule.Title, Commands: []string{"switch_turn_on", "switch_turn_off"}, State: rule})
-	_ = a.materializeRules(time.Now())
+	if rule.Selection == "" {
+		rule.Selection = "all"
+	}
+	rule.Enabled = true
+	id := strings.TrimSpace(cmd.ID)
+	if id == "" {
+		seed, _ := json.Marshal(rule.Query)
+		id = shortHash(string(seed))
+	}
+	entity := domain.Entity{ID: "rule-" + id, Plugin: PluginID, DeviceID: "recording-rules", Type: "recording_rule", Name: cmd.Name, State: rule}
+	if entity.Name == "" {
+		entity.Name = rule.Query.Title
+	}
+	if err := a.store.Save(entity); err != nil {
+		return err
+	}
+	return a.materializeRules(time.Now().UTC())
 }
 
-func (a *App) setRuleEnabled(id string, enabled bool) {
-	key := domain.EntityKey{Plugin: PluginID, DeviceID: "recording-rules", ID: id}
-	raw, err := a.store.Get(key)
-	if err != nil {
-		return
+func (a *App) deleteRecordingRule(reference string) error {
+	id := strings.TrimSpace(reference)
+	if strings.HasPrefix(id, PluginID+".recording-rules.") {
+		id = strings.TrimPrefix(id, PluginID+".recording-rules.")
 	}
-	var entity domain.Entity
-	if json.Unmarshal(raw, &entity) != nil {
-		return
+	if !strings.HasPrefix(id, "rule-") {
+		id = "rule-" + id
 	}
-	rule, ok := entity.State.(domain.TVRecordingRule)
-	if !ok {
-		return
-	}
-	rule.Enabled = enabled
-	entity.State = rule
-	_ = a.store.Save(entity)
-	if enabled {
-		_ = a.materializeRules(time.Now())
-	}
-	if !enabled {
-		a.disableRuleTimers(rule.SeriesID)
-	}
-}
-
-func (a *App) disableRuleTimers(seriesID string) {
-	entries, _ := a.store.Search("sb-scheduler.*.timer")
-	for _, entry := range entries {
-		var entity domain.Entity
-		if json.Unmarshal(entry.Data, &entity) != nil {
-			continue
-		}
-		timer, ok := entity.State.(domain.Timer)
-		if !ok {
-			continue
-		}
-		var input domain.RecordingStartInput
-		if json.Unmarshal(timer.Input, &input) != nil || input.Program == nil || input.Program.SeriesID != seriesID {
-			continue
-		}
-		_ = a.scheduler.DisableTimer(domain.EntityKey{Plugin: entity.Plugin, DeviceID: entity.DeviceID, ID: entity.ID})
-	}
+	return a.store.Delete(domain.EntityKey{Plugin: PluginID, DeviceID: "recording-rules", ID: id})
 }
 
 func (a *App) materializeRules(now time.Time) error {
@@ -81,103 +59,94 @@ func (a *App) materializeRules(now time.Time) error {
 		if json.Unmarshal(entry.Data, &entity) != nil {
 			continue
 		}
-		rule, ok := entity.State.(domain.TVRecordingRule)
+		rule, ok := entity.State.(domain.RecordingRule)
 		if !ok || !rule.Enabled {
 			continue
 		}
+		seriesID := stringAttribute(rule.Query.Attributes, "seriesID")
+		newOnly := boolAttribute(rule.Query.Attributes, "newOnly")
+		channels := stringListAttribute(rule.Query.Attributes, "channelNumbers")
+		created := 0
 		for channelKey, programs := range a.programs {
 			channel := a.channelStates[channelKey]
-			if len(rule.ChannelNumbers) > 0 && !contains(rule.ChannelNumbers, channel.Number) {
+			if len(channels) > 0 && !contains(channels, channel.Number) {
 				continue
 			}
 			for i := range programs {
 				p := programs[i]
-				if p.SeriesID != rule.SeriesID || !p.StartsAt.After(now) || rule.NewOnly && !p.IsNew {
+				if !p.StartsAt.After(now) || seriesID != "" && p.SeriesID != seriesID || rule.Query.Title != "" && !strings.EqualFold(p.Title, rule.Query.Title) || newOnly && !p.IsNew {
 					continue
 				}
-				a.createAiringTimer(channelKey, &p, rule.Profile)
+				if rule.Selection == "next" && created > 0 {
+					continue
+				}
+				if rule.Limit > 0 && rule.ScheduledCount+created >= rule.Limit {
+					continue
+				}
+				if a.createAiringSchedule(channelKey, &p, rule.Profile) {
+					created++
+				}
 			}
 		}
 		scanned := time.Now().UTC()
 		rule.LastScannedAt = &scanned
+		rule.ScheduledCount += created
+		if rule.Selection == "next" && rule.ScheduledCount > 0 || rule.Limit > 0 && rule.ScheduledCount >= rule.Limit {
+			rule.Enabled = false
+		}
 		entity.State = rule
 		_ = a.store.Save(entity)
 	}
 	return nil
 }
 
-func (a *App) createAiringTimer(channelKey string, program *domain.TVProgram, profile string) {
+func (a *App) createAiringSchedule(channelKey string, program *domain.TVProgram, profile string) bool {
 	if len(a.recorders) == 0 {
-		return
+		return false
 	}
 	target := a.selectRecorder(program.StartsAt, program.EndsAt)
-	input, _ := json.Marshal(domain.RecordingStartInput{ChannelKey: channelKey, Program: program, Profile: profile})
+	programRaw, _ := json.Marshal(program)
+	channelRaw, _ := json.Marshal(a.channelStates[channelKey])
+	startInput, _ := json.Marshal(domain.RecordStart{Source: domain.PlayableSource{Kind: "live", Entity: channelKey}, Profile: profile, Metadata: map[string]json.RawMessage{"program": programRaw, "channel": channelRaw}})
 	id := "airing-" + shortHash(program.AiringID)
-	timerKey, err := a.scheduler.CreateTimer(scheduler.CreateTimerRequest{ID: id, Name: program.Title, Timer: domain.Timer{Enabled: true, Target: target, Input: input, On: domain.TimerTrigger{Kind: "at", At: &program.StartsAt}, Off: domain.TimerTrigger{Kind: "at", At: &program.EndsAt}}})
+	_, err := a.scheduler.CreateSchedule(scheduler.CreateScheduleRequest{ID: id, Name: program.Title, Schedule: domain.Schedule{Enabled: true, Steps: []domain.ScheduleStep{{ID: "start", Trigger: domain.Trigger{Kind: "at", At: &program.StartsAt}, Actions: []domain.Action{{Target: target, Command: "record_start", Input: startInput}}}, {ID: "stop", Trigger: domain.Trigger{Kind: "at", At: &program.EndsAt}, Actions: []domain.Action{{Target: target, Command: "record_stop"}}}}}})
 	if err != nil {
-		log.Printf("plugin-hdhomerun: create airing timer: %v", err)
-		return
+		log.Printf("plugin-hdhomerun: create airing schedule: %v", err)
+		return false
 	}
-	channel := a.channelStates[channelKey]
-	recording := domain.TVRecording{Status: "scheduled", Provider: PluginID, ExternalID: timerKey.Key(), Channel: channel, Program: *program, StartsAt: program.StartsAt, EndsAt: program.EndsAt}
-	_ = a.store.Save(domain.Entity{ID: "scheduled-" + shortHash(program.AiringID), Plugin: PluginID, DeviceID: recordingsDeviceID, Type: "tv_recording", Name: program.Title, Commands: []string{"tv_record_cancel"}, State: recording})
-}
-
-func (a *App) cancelTVRecording(addr messenger.Address) {
-	raw, err := a.store.Get(domain.EntityKey{Plugin: PluginID, DeviceID: addr.DeviceID, ID: addr.EntityID})
-	if err != nil {
-		return
-	}
-	var envelope struct {
-		State json.RawMessage `json:"state"`
-	}
-	if json.Unmarshal(raw, &envelope) != nil {
-		return
-	}
-	var recording domain.TVRecording
-	if json.Unmarshal(envelope.State, &recording) != nil || recording.ExternalID == "" {
-		return
-	}
-	parts := strings.Split(recording.ExternalID, ".")
-	if len(parts) < 3 {
-		return
-	}
-	key := domain.EntityKey{Plugin: parts[0], DeviceID: parts[1], ID: strings.Join(parts[2:], ".")}
-	if timerRaw, getErr := a.store.Get(key); getErr == nil {
-		var timerEntity domain.Entity
-		if json.Unmarshal(timerRaw, &timerEntity) == nil {
-			if timer, ok := timerEntity.State.(domain.Timer); ok && timer.Target != "" {
-				targetParts := strings.Split(timer.Target, ".")
-				if len(targetParts) >= 3 {
-					_ = a.cmds.Send(domain.EntityKey{Plugin: targetParts[0], DeviceID: targetParts[1], ID: strings.Join(targetParts[2:], ".")}, domain.SwitchTurnOff{})
-				}
-			}
-		}
-	}
-	if err := a.scheduler.DisableTimer(key); err != nil {
-		log.Printf("plugin-hdhomerun: cancel recording: %v", err)
-		return
-	}
-	recording.Status = "canceled"
-	_ = a.store.Save(domain.Entity{ID: addr.EntityID, Plugin: PluginID, DeviceID: addr.DeviceID, Type: "tv_recording", Name: recording.Program.Title, Commands: []string{"tv_record_cancel"}, State: recording})
+	return true
 }
 
 func (a *App) selectRecorder(start, end time.Time) string {
 	recorders := append([]string(nil), a.recorders...)
 	sort.Strings(recorders)
 	busy := map[string]bool{}
-	entries, _ := a.store.Search("sb-scheduler.timer-*.timer")
+	entries, _ := a.store.Search("sb-scheduler.schedule-*.schedule")
 	for _, entry := range entries {
 		var entity domain.Entity
 		if json.Unmarshal(entry.Data, &entity) != nil {
 			continue
 		}
-		timer, ok := entity.State.(domain.Timer)
-		if !ok || !timer.Enabled || timer.On.At == nil || timer.Off.At == nil {
+		schedule, ok := entity.State.(domain.Schedule)
+		if !ok || !schedule.Enabled {
 			continue
 		}
-		if timer.On.At.Before(end) && timer.Off.At.After(start) {
-			busy[timer.Target] = true
+		var on, off *time.Time
+		target := ""
+		for _, step := range schedule.Steps {
+			if len(step.Actions) == 0 || step.Trigger.At == nil {
+				continue
+			}
+			if step.Actions[0].Command == "record_start" {
+				on = step.Trigger.At
+				target = step.Actions[0].Target
+			}
+			if step.Actions[0].Command == "record_stop" {
+				off = step.Trigger.At
+			}
+		}
+		if on != nil && off != nil && on.Before(end) && off.After(start) {
+			busy[target] = true
 		}
 	}
 	for _, recorder := range recorders {
@@ -188,6 +157,21 @@ func (a *App) selectRecorder(start, end time.Time) string {
 	return recorders[0]
 }
 
+func stringAttribute(values map[string]json.RawMessage, key string) string {
+	var out string
+	_ = json.Unmarshal(values[key], &out)
+	return out
+}
+func boolAttribute(values map[string]json.RawMessage, key string) bool {
+	var out bool
+	_ = json.Unmarshal(values[key], &out)
+	return out
+}
+func stringListAttribute(values map[string]json.RawMessage, key string) []string {
+	var out []string
+	_ = json.Unmarshal(values[key], &out)
+	return out
+}
 func shortHash(v string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(v)))
 	return hex.EncodeToString(sum[:8])

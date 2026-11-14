@@ -1,18 +1,80 @@
 package app
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
 	domain "github.com/slidebolt/sb-domain"
 	media "github.com/slidebolt/sb-media-sdk"
+	storage "github.com/slidebolt/sb-storage-sdk"
 )
 
-func (a *App) Browse(media.CatalogRequest) media.CatalogPage {
-	return media.CatalogPage{Error: "HDHomeRun does not provide a media library catalog"}
+func (a *App) Browse(req media.CatalogRequest) media.CatalogPage {
+	if req.LibraryID != recordingsDeviceID && req.ServerID != recordingsDeviceID {
+		return media.CatalogPage{Error: "media library not found"}
+	}
+	entries, err := a.store.SearchFiles(storage.Internal, PluginID+"."+recordingsDeviceID+".recording-*")
+	if err != nil {
+		return media.CatalogPage{Error: err.Error()}
+	}
+	items := []media.MediaItem{}
+	for _, entry := range entries {
+		var record recordingRecord
+		if json.Unmarshal(entry.Data, &record) != nil {
+			continue
+		}
+		if req.ItemID != "" && record.ID != req.ItemID {
+			continue
+		}
+		title := fileName(record)
+		if req.Query != "" && !strings.Contains(strings.ToLower(title), strings.ToLower(req.Query)) {
+			continue
+		}
+		metadata := map[string]json.RawMessage{}
+		putRaw(metadata, "status", record.Status)
+		putRaw(metadata, "format", record.Format)
+		putRaw(metadata, "profile", record.Profile)
+		putRaw(metadata, "relativePath", record.RelativePath)
+		putRaw(metadata, "startedAt", record.StartedAt)
+		putRaw(metadata, "finishedAt", record.FinishedAt)
+		putRaw(metadata, "sizeBytes", record.BytesWritten)
+		putRaw(metadata, "error", record.Error)
+		putRaw(metadata, "channel", record.Channel)
+		putRaw(metadata, "program", record.Program)
+		items = append(items, media.MediaItem{Ref: mediaItemRef(record.ID), Kind: mediaKind(record), Title: title, Playable: record.Status == recordingStatusCompleted, Metadata: metadata})
+	}
+	return media.CatalogPage{Items: items, Total: len(items)}
+}
+func putRaw(values map[string]json.RawMessage, key string, value any) {
+	data, _ := json.Marshal(value)
+	if string(data) != "null" && string(data) != "\"\"" && string(data) != "0" {
+		values[key] = data
+	}
+}
+func mediaKind(record recordingRecord) string {
+	if record.Program != nil && record.Program.EpisodeTitle != "" {
+		return "episode"
+	}
+	return "recording"
 }
 func (a *App) Artwork(media.ArtworkRequest) media.ArtworkReply {
 	return media.ArtworkReply{Error: "HDHomeRun guide artwork is not available"}
+}
+func (a *App) Resolve(req media.ResolveRequest) media.ResolveReply {
+	if req.Source.Kind != "live" || req.Source.Entity == "" {
+		return media.ResolveReply{Error: "HDHomeRun resolves live sources only"}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	channel, ok := a.channels[req.Source.Entity]
+	if !ok {
+		return media.ResolveReply{Error: "live source not found"}
+	}
+	if strings.Contains(channel.Tags, "drm") {
+		return media.ResolveReply{Error: "source is DRM protected"}
+	}
+	return media.ResolveReply{URL: channel.URL, Kind: "video", Format: "mpegts"}
 }
 func (a *App) Guide(req media.GuideRequest) media.GuidePage {
 	a.mu.Lock()
