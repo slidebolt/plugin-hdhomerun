@@ -57,7 +57,7 @@ func New() *App {
 }
 
 func (a *App) Hello() contract.HelloResponse {
-	return contract.HelloResponse{ID: PluginID, Kind: contract.KindPlugin, ContractVersion: contract.ContractVersion, DependsOn: []string{"messenger", "storage", "scheduler"}}
+	return contract.HelloResponse{ID: PluginID, Kind: contract.KindPlugin, ContractVersion: contract.ContractVersion, DependsOn: []string{"messenger", "storage", "scheduler"}, Definitions: contract.DescribePlugin("HDHomeRun", "Discovers television tuners, guide channels, recording controls, and recording outputs.", "recording_file", "recording_switch", "select", "tv_channel", "tv_recording", "tv_recording_rule", "tv_tuner")}
 }
 
 func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) {
