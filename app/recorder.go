@@ -142,7 +142,7 @@ func (a *App) capture(ctx context.Context, session *recordingSession, recorderKe
 			} else if state.Profile == "universal-mp4" {
 				err = copyStream(resp.Body, partialAbs)
 			} else {
-				err = writeStream(ctx, state.Profile, resp.Body, partialAbs)
+				err = writeStream(ctx, a.config.FFmpegPath, state.Profile, resp.Body, partialAbs)
 			}
 		}
 	}
@@ -245,9 +245,9 @@ func (a *App) encodeUniversal(fileID, sourceAbs, finalAbs string, state recordin
 	_ = a.saveRecordingFile(fileID, state)
 	outputPartial := finalAbs + ".partial"
 	args := universalArgs(sourceAbs, outputPartial)
-	err := exec.CommandContext(a.ctx, "ffmpeg", args...).Run()
+	err := exec.CommandContext(a.ctx, a.config.FFmpegPath, args...).Run()
 	if err == nil {
-		err = validateUniversal(a.ctx, outputPartial)
+		err = validateUniversal(a.ctx, a.config.FFprobePath, outputPartial)
 	}
 	if err == nil {
 		err = os.Rename(outputPartial, finalAbs)
@@ -277,8 +277,8 @@ func universalArgs(source, output string) []string {
 	}
 }
 
-func validateUniversal(ctx context.Context, path string) error {
-	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=codec_name,codec_type,pix_fmt", "-of", "json", path).Output()
+func validateUniversal(ctx context.Context, ffprobePath, path string) error {
+	out, err := exec.CommandContext(ctx, ffprobePath, "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=codec_name,codec_type,pix_fmt", "-of", "json", path).Output()
 	if err != nil {
 		return fmt.Errorf("ffprobe: %w", err)
 	}
@@ -335,7 +335,7 @@ func (a *App) recoverEncodings() {
 	}
 }
 
-func writeStream(ctx context.Context, profile string, src io.Reader, path string) error {
+func writeStream(ctx context.Context, ffmpegPath, profile string, src io.Reader, path string) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -353,7 +353,7 @@ func writeStream(ctx context.Context, profile string, src io.Reader, path string
 	} else {
 		return fmt.Errorf("unknown profile %q", profile)
 	}
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	cmd.Stdin = src
 	cmd.Stdout = f
 	cmd.Stderr = os.Stderr

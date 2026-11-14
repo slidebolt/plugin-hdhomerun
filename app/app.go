@@ -57,7 +57,21 @@ func New() *App {
 }
 
 func (a *App) Hello() contract.HelloResponse {
-	return contract.HelloResponse{ID: PluginID, Kind: contract.KindPlugin, ContractVersion: contract.ContractVersion, DependsOn: []string{"messenger", "storage", "scheduler"}, Definitions: contract.DescribePlugin("HDHomeRun", "Discovers television sources and records them into provider-backed media items.", "media_library", "media_source", "recorder", "recording_rule", "select", "tv_channel", "tv_tuner")}
+	return contract.HelloResponse{
+		ID: PluginID, Kind: contract.KindPlugin, ContractVersion: contract.ContractVersion,
+		DependsOn:   []string{"messenger", "storage", "scheduler"},
+		Definitions: contract.DescribePlugin("HDHomeRun", "Discovers television sources and records them into provider-backed media items.", "media_library", "media_source", "recorder", "recording_rule", "select", "tv_channel", "tv_tuner"),
+		Setup: &contract.SetupDefinition{Mode: contract.SetupSelectable, Category: "Television", Fields: []contract.SetupField{
+			{Key: "devices", Environment: "HDHOMERUN_DEVICES", Name: "Tuner URLs", Description: "Comma-separated HDHomeRun base URLs.", Control: contract.SetupText, Default: json.RawMessage(`"http://hdhomerun.local"`)},
+			{Key: "recording_directory", Environment: "HDHOMERUN_RECORDING_DIR", Name: "Recording directory", Description: "Directory where completed and staged recordings are written.", Control: contract.SetupDirectory, Required: true, Default: json.RawMessage(`"recordings"`), RelativeTo: "sandbox"},
+			{Key: "recording_profile", Environment: "HDHOMERUN_RECORDING_PROFILE", Name: "Recording profile", Description: "Container and encoding policy for completed recordings.", Control: contract.SetupSelect, Default: json.RawMessage(`"universal-mp4"`), Options: []contract.SetupOption{{Value: "universal-mp4", Label: "Universal MP4"}, {Value: "raw-ts", Label: "Raw transport stream"}, {Value: "remux-mkv", Label: "Remuxed MKV"}, {Value: "h264-mp4", Label: "H.264 MP4"}}},
+			{Key: "xmltv_url", Environment: "HDHOMERUN_XMLTV_URL", Name: "XMLTV URL", Description: "Optional alternate XMLTV guide feed.", Control: contract.SetupText, Format: "uri", Advanced: true},
+			{Key: "guide_email", Environment: "HDHOMERUN_GUIDE_EMAIL", Name: "Guide email", Description: "Optional email sent to the SiliconDust guide endpoint.", Control: contract.SetupText, Advanced: true},
+		}, Tools: []contract.ToolRequirement{
+			{ID: "ffmpeg", Name: "FFmpeg", Description: "Remuxes and encodes television recordings.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "HDHOMERUN_FFMPEG_PATH", Required: true, InstallHint: "Install the ffmpeg package with your operating system package manager.", Checks: []contract.ToolCheck{{Arguments: []string{"-version"}, Contains: []string{"ffmpeg version"}}, {Arguments: []string{"-hide_banner", "-encoders"}, Contains: []string{" libx264 ", " aac "}}, {Arguments: []string{"-hide_banner", "-muxers"}, Contains: []string{" matroska ", " mp4 ", " mpegts "}}, {Arguments: []string{"-hide_banner", "-filters"}, Contains: []string{" bwdif ", " scale ", " setsar "}}}},
+			{ID: "ffprobe", Name: "FFprobe", Description: "Validates completed recordings and reads their media metadata.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "HDHOMERUN_FFPROBE_PATH", Required: true, InstallHint: "Install the ffmpeg package with your operating system package manager.", Checks: []contract.ToolCheck{{Arguments: []string{"-version"}, Contains: []string{"ffprobe version"}}}},
+		}},
+	}
 }
 
 func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) {

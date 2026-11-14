@@ -52,7 +52,7 @@ func TestUniversalProfileProducesValidatedMP4(t *testing.T) {
 	if out, err := encode.CombinedOutput(); err != nil {
 		t.Fatalf("encode: %v: %s", err, out)
 	}
-	if err := validateUniversal(context.Background(), output); err != nil {
+	if err := validateUniversal(context.Background(), "ffprobe", output); err != nil {
 		t.Fatal(err)
 	}
 }
