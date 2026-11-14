@@ -2,21 +2,19 @@ package app
 
 import "testing"
 
-func TestHelloSetupAndToolRequirementsAreValid(t *testing.T) {
+func TestHelloUsesMediaDependencyWithoutOwningTools(t *testing.T) {
 	hello := New().Hello()
 	if err := hello.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if hello.Setup == nil || len(hello.Setup.Tools) != 2 {
+	if hello.Setup == nil || len(hello.Setup.Tools) != 0 {
 		t.Fatalf("setup tools = %#v", hello.Setup)
 	}
-}
-
-func TestLoadConfigUsesInjectedToolPaths(t *testing.T) {
-	t.Setenv("HDHOMERUN_FFMPEG_PATH", "/opt/media/ffmpeg")
-	t.Setenv("HDHOMERUN_FFPROBE_PATH", "/opt/media/ffprobe")
-	config := loadConfig()
-	if config.FFmpegPath != "/opt/media/ffmpeg" || config.FFprobePath != "/opt/media/ffprobe" {
-		t.Fatalf("tool paths = %q, %q", config.FFmpegPath, config.FFprobePath)
+	foundMedia := false
+	for _, dependency := range hello.DependsOn {
+		foundMedia = foundMedia || dependency == "media"
+	}
+	if !foundMedia {
+		t.Fatalf("dependencies = %v", hello.DependsOn)
 	}
 }

@@ -38,8 +38,8 @@ type App struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	mu            sync.Mutex
-	encodeMu      sync.Mutex
 	wg            sync.WaitGroup
+	media         *media.Client
 	channels      map[string]hdhr.Channel
 	channelStates map[string]domain.TVChannel
 	programs      map[string][]domain.TVProgram
@@ -59,7 +59,7 @@ func New() *App {
 func (a *App) Hello() contract.HelloResponse {
 	return contract.HelloResponse{
 		ID: PluginID, Kind: contract.KindPlugin, ContractVersion: contract.ContractVersion,
-		DependsOn:   []string{"messenger", "storage", "scheduler"},
+		DependsOn:   []string{"messenger", "storage", "scheduler", "media"},
 		Definitions: contract.DescribePlugin("HDHomeRun", "Discovers television sources and records them into provider-backed media items.", "media_library", "media_source", "recorder", "recording_rule", "select", "tv_channel", "tv_tuner"),
 		Setup: &contract.SetupDefinition{Mode: contract.SetupSelectable, Category: "Television", Fields: []contract.SetupField{
 			{Key: "devices", Environment: "HDHOMERUN_DEVICES", Name: "Tuner URLs", Description: "Comma-separated HDHomeRun base URLs.", Control: contract.SetupText, Default: json.RawMessage(`"http://hdhomerun.local"`)},
@@ -67,9 +67,6 @@ func (a *App) Hello() contract.HelloResponse {
 			{Key: "recording_profile", Environment: "HDHOMERUN_RECORDING_PROFILE", Name: "Recording profile", Description: "Container and encoding policy for completed recordings.", Control: contract.SetupSelect, Default: json.RawMessage(`"universal-mp4"`), Options: []contract.SetupOption{{Value: "universal-mp4", Label: "Universal MP4"}, {Value: "raw-ts", Label: "Raw transport stream"}, {Value: "remux-mkv", Label: "Remuxed MKV"}, {Value: "h264-mp4", Label: "H.264 MP4"}}},
 			{Key: "xmltv_url", Environment: "HDHOMERUN_XMLTV_URL", Name: "XMLTV URL", Description: "Optional alternate XMLTV guide feed.", Control: contract.SetupText, Format: "uri", Advanced: true},
 			{Key: "guide_email", Environment: "HDHOMERUN_GUIDE_EMAIL", Name: "Guide email", Description: "Optional email sent to the SiliconDust guide endpoint.", Control: contract.SetupText, Advanced: true},
-		}, Tools: []contract.ToolRequirement{
-			{ID: "ffmpeg", Name: "FFmpeg", Description: "Remuxes and encodes television recordings.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "HDHOMERUN_FFMPEG_PATH", Required: true, InstallHint: "Install the ffmpeg package with your operating system package manager.", Checks: []contract.ToolCheck{{Arguments: []string{"-version"}, Contains: []string{"ffmpeg version"}}, {Arguments: []string{"-hide_banner", "-encoders"}, Contains: []string{" libx264 ", " aac "}}, {Arguments: []string{"-hide_banner", "-muxers"}, Contains: []string{" matroska ", " mp4 ", " mpegts "}}, {Arguments: []string{"-hide_banner", "-filters"}, Contains: []string{" bwdif ", " scale ", " setsar "}}}},
-			{ID: "ffprobe", Name: "FFprobe", Description: "Validates completed recordings and reads their media metadata.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "HDHOMERUN_FFPROBE_PATH", Required: true, InstallHint: "Install the ffmpeg package with your operating system package manager.", Checks: []contract.ToolCheck{{Arguments: []string{"-version"}, Contains: []string{"ffprobe version"}}}},
 		}},
 	}
 }
@@ -85,6 +82,7 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 		return nil, err
 	}
 	a.msg, a.store, a.scheduler, a.config = msg, store, scheduler.NewClient(msg), loadConfig()
+	a.media = media.NewClient(msg)
 	a.cmds = messenger.NewCommands(msg, domain.LookupCommand)
 	sub, err := a.cmds.Receive(PluginID+".>", a.handleCommand)
 	if err != nil {
@@ -96,6 +94,16 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 		return nil, err
 	}
 	a.subs = append(a.subs, providerSubs...)
+	jobSub, err := a.media.OnFileJobs(a.handleFileJob)
+	if err != nil {
+		return nil, err
+	}
+	a.subs = append(a.subs, jobSub)
+	startedSub, err := a.media.OnServiceStarted(a.recoverEncodings)
+	if err != nil {
+		return nil, err
+	}
+	a.subs = append(a.subs, startedSub)
 	a.ctx, a.cancel = context.WithCancel(context.Background())
 	if err := a.reconcile(a.ctx); err != nil {
 		log.Printf("plugin-hdhomerun: initial reconcile: %v", err)
@@ -107,14 +115,14 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 }
 
 func (a *App) OnShutdown() error {
+	a.mu.Lock()
+	for _, s := range a.sessions {
+		s.stop(false)
+	}
+	a.mu.Unlock()
 	if a.cancel != nil {
 		a.cancel()
 	}
-	a.mu.Lock()
-	for _, s := range a.sessions {
-		s.stop()
-	}
-	a.mu.Unlock()
 	a.wg.Wait()
 	for _, sub := range a.subs {
 		_ = sub.Unsubscribe()
@@ -193,7 +201,7 @@ func (a *App) syncDevice(d hdhr.Discover, lineup []hdhr.Channel) {
 					a.mu.Lock()
 					active := a.sessions[key] != nil
 					a.mu.Unlock()
-					if (state.Status == "recording" || state.Status == "processing") && !active {
+					if state.Status == "recording" && !active {
 						if state.Output != nil {
 							a.markInterrupted(state.Output.ItemID)
 						}
@@ -377,8 +385,10 @@ func (a *App) handleCommand(addr messenger.Address, cmd any) {
 	switch c := cmd.(type) {
 	case domain.RecordStart:
 		a.startRecording(key, c)
-	case domain.RecordStop, domain.RecordCancel:
-		a.stopRecording(key)
+	case domain.RecordStop:
+		a.stopRecording(key, false)
+	case domain.RecordCancel:
+		a.stopRecording(key, true)
 	case domain.RecordingRuleCreate:
 		if err := a.createRecordingRule(addr, c); err != nil {
 			log.Printf("plugin-hdhomerun: create recording rule: %v", err)
